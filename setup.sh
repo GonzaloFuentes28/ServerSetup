@@ -227,7 +227,55 @@ print_status "Installing monitoring tools..."
 apt install -y htop iotop nethogs
 
 # ============================================
-# 10. Test SSH configuration before applying
+# 10. Install Docker
+# ============================================
+print_warning "Do you want to install Docker? (y/n)"
+read -r INSTALL_DOCKER
+
+if [[ $INSTALL_DOCKER == "y" || $INSTALL_DOCKER == "Y" ]]; then
+    print_status "Installing Docker..."
+
+    # Install prerequisites
+    apt install -y ca-certificates curl gnupg lsb-release
+
+    # Add Docker's official GPG key
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Set up Docker repository
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    # Install Docker Engine
+    apt update
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Add user to docker group
+    usermod -aG docker "$NEW_USER"
+    print_status "User $NEW_USER added to docker group"
+
+    # Start and enable Docker
+    systemctl enable docker
+    systemctl start docker
+
+    # Verify Docker installation
+    if docker --version &> /dev/null; then
+        DOCKER_VERSION=$(docker --version)
+        print_status "Docker installed successfully: $DOCKER_VERSION"
+    else
+        print_warning "Docker installation completed but version check failed"
+    fi
+
+    print_status "Docker installation complete!"
+    print_warning "Note: $NEW_USER will need to log out and back in for docker group membership to take effect"
+else
+    print_status "Skipping Docker installation"
+fi
+
+# ============================================
+# 11. Test SSH configuration before applying
 # ============================================
 print_status "Testing SSH configuration..."
 TEST_RESULT=0
@@ -270,6 +318,10 @@ echo "    - Password authentication disabled"
 echo "    - Only SSH key authentication allowed"
 echo "    - SSH access limited to: $NEW_USER"
 echo "  • Automatic security updates enabled"
+if [[ $INSTALL_DOCKER == "y" || $INSTALL_DOCKER == "Y" ]]; then
+    echo "  • Docker installed with docker-compose plugin"
+    echo "    - $NEW_USER added to docker group (requires re-login)"
+fi
 echo ""
 print_warning "============================================"
 print_warning "CRITICAL: You MUST test SSH before restarting!"
