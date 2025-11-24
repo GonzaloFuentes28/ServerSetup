@@ -25,6 +25,24 @@ print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
 }
 
+# Function to validate username
+validate_username() {
+    local username=$1
+    if [[ ! $username =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Function to validate port number
+validate_port() {
+    local port=$1
+    if [[ ! $port =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    return 0
+}
+
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
    print_error "This script must be run as root"
@@ -42,14 +60,22 @@ apt update && apt upgrade -y
 # ============================================
 # 2. Create new sudo user
 # ============================================
-read -p "Enter username for new sudo user: " NEW_USER
+while true; do
+    read -p "Enter username for new sudo user: " NEW_USER
+
+    if validate_username "$NEW_USER"; then
+        break
+    else
+        print_error "Invalid username. Use only lowercase letters, numbers, underscore, and hyphen. Must start with letter or underscore."
+    fi
+done
 
 if id "$NEW_USER" &>/dev/null; then
     print_warning "User $NEW_USER already exists, skipping user creation"
 else
     print_status "Creating user: $NEW_USER"
-    adduser --gecos "" $NEW_USER
-    usermod -aG sudo $NEW_USER
+    adduser --gecos "" "$NEW_USER"
+    usermod -aG sudo "$NEW_USER"
     print_status "User $NEW_USER created and added to sudo group"
 fi
 
@@ -61,11 +87,11 @@ read -r COPY_KEYS
 
 if [[ $COPY_KEYS == "y" || $COPY_KEYS == "Y" ]]; then
     if [ -f /root/.ssh/authorized_keys ]; then
-        mkdir -p /home/$NEW_USER/.ssh
-        cp /root/.ssh/authorized_keys /home/$NEW_USER/.ssh/
-        chown -R $NEW_USER:$NEW_USER /home/$NEW_USER/.ssh
-        chmod 700 /home/$NEW_USER/.ssh
-        chmod 600 /home/$NEW_USER/.ssh/authorized_keys
+        mkdir -p "/home/$NEW_USER/.ssh"
+        cp /root/.ssh/authorized_keys "/home/$NEW_USER/.ssh/"
+        chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.ssh"
+        chmod 700 "/home/$NEW_USER/.ssh"
+        chmod 600 "/home/$NEW_USER/.ssh/authorized_keys"
         print_status "SSH keys copied to $NEW_USER"
     else
         print_warning "No authorized_keys found in /root/.ssh/"
@@ -127,9 +153,13 @@ if [[ $OPEN_PORTS == "y" || $OPEN_PORTS == "Y" ]]; then
     read -r PORTS
     IFS=',' read -ra PORT_ARRAY <<< "$PORTS"
     for port in "${PORT_ARRAY[@]}"; do
-        port=$(echo $port | xargs)  # Trim whitespace
-        ufw allow $port/tcp
-        print_status "Opened port: $port"
+        port=$(echo "$port" | xargs)  # Trim whitespace
+        if validate_port "$port"; then
+            ufw allow "$port/tcp"
+            print_status "Opened port: $port"
+        else
+            print_warning "Invalid port number: $port (skipping)"
+        fi
     done
 fi
 
@@ -154,6 +184,14 @@ sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_co
 sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
 
+# Restrict SSH access to the new user only
+if ! grep -q "^AllowUsers" /etc/ssh/sshd_config; then
+    echo "AllowUsers $NEW_USER" >> /etc/ssh/sshd_config
+    print_status "SSH access restricted to user: $NEW_USER"
+else
+    print_warning "AllowUsers already configured in sshd_config, please verify manually"
+fi
+
 print_status "SSH configuration hardened"
 
 # ============================================
@@ -162,8 +200,9 @@ print_status "SSH configuration hardened"
 print_status "Installing additional security tools..."
 apt install -y unattended-upgrades apt-listchanges
 
-# Enable automatic security updates
-dpkg-reconfigure -plow unattended-upgrades
+# Enable automatic security updates (non-interactive)
+echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections
+dpkg-reconfigure -f noninteractive unattended-upgrades
 
 # ============================================
 # 8. Configure automatic security updates
@@ -191,18 +230,24 @@ apt install -y htop iotop nethogs
 # 10. Test SSH configuration before applying
 # ============================================
 print_status "Testing SSH configuration..."
+TEST_RESULT=0
 if command -v sshd &> /dev/null; then
     sshd -t
+    TEST_RESULT=$?
 elif command -v /usr/sbin/sshd &> /dev/null; then
     /usr/sbin/sshd -t
+    TEST_RESULT=$?
 else
     print_warning "Could not find sshd binary to test config, skipping test"
+    TEST_RESULT=0
 fi
 
-if [ $? -eq 0 ]; then
+if [ $TEST_RESULT -eq 0 ]; then
     print_status "SSH configuration is valid"
 else
-    print_error "SSH configuration has errors. Please check before restarting SSH"
+    print_error "SSH configuration has errors. Restoring backup..."
+    cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+    print_error "SSH configuration restored from backup. Please check errors before restarting SSH"
     exit 1
 fi
 
@@ -226,11 +271,29 @@ echo "    - Only SSH key authentication allowed"
 echo "    - SSH access limited to: $NEW_USER"
 echo "  • Automatic security updates enabled"
 echo ""
-print_warning "IMPORTANT: Before logging out, test SSH access with the new user!"
+print_warning "============================================"
+print_warning "CRITICAL: You MUST test SSH before restarting!"
+print_warning "============================================"
 echo ""
-echo "To test, open a NEW terminal and run:"
+echo "Open a NEW terminal (keep this one open!) and verify SSH works:"
 echo "  ssh $NEW_USER@YOUR_SERVER_IP"
 echo ""
+print_warning "If you're connected via SSH now, restarting the service may disconnect you!"
+print_warning "Only proceed if you've verified the new user can log in successfully."
+echo ""
+print_warning "Have you successfully tested SSH login with $NEW_USER? (y/n)"
+read -r SSH_TESTED
+
+if [[ $SSH_TESTED != "y" && $SSH_TESTED != "Y" ]]; then
+    print_warning "SSH service NOT restarted. When ready, run:"
+    echo "  systemctl restart ssh (or sshd)"
+    echo ""
+    print_warning "If you get locked out, you can restore the SSH config with:"
+    echo "  cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config"
+    echo "  systemctl restart ssh"
+    exit 0
+fi
+
 print_warning "Do you want to restart SSH service now? (y/n)"
 read -r RESTART_SSH
 
@@ -247,7 +310,7 @@ if [[ $RESTART_SSH == "y" || $RESTART_SSH == "Y" ]]; then
     print_status "SSH service restarted"
     echo ""
     print_warning "SSH has been restarted with new configuration."
-    print_warning "Make sure you can log in with $NEW_USER before closing this session!"
+    print_warning "Your current session may disconnect. Reconnect with: ssh $NEW_USER@YOUR_SERVER_IP"
 else
     print_warning "Remember to restart SSH manually: systemctl restart ssh (or sshd)"
 fi
